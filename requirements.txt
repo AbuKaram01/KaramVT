@@ -1,0 +1,10 @@
+faster-whisper
+av>=11,<19  # PyAV 19 removed metadata_errors, which faster-whisper 1.2.1 still passes
+llama-cpp-python
+langdetect
+pytesseract
+Pillow
+
+# PyGObject (GUI only) is best installed as a system package on Linux
+# (see README) rather than through pip, since it binds to your system's
+# GTK/GObject-Introspection libraries.

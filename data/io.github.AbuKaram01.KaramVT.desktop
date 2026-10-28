@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=KaramVT
+Comment=Generate and translate video subtitles, fully offline
+Exec=karamvt-gui
+Icon=io.github.AbuKaram01.KaramVT
+Terminal=false
+Categories=AudioVideo;Video;Utility;
+StartupNotify=true

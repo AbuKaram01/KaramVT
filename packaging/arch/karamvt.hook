@@ -1,0 +1,12 @@
+# Arch is a rolling release: when Python moves to a new minor version, KaramVT's venv
+# (which is tied to the Python it was created with) stops working. This rebuilds it.
+# It does nothing for ordinary Python updates within the same minor version.
+[Trigger]
+Operation = Upgrade
+Type = Package
+Target = python
+
+[Action]
+Description = Rebuilding KaramVT's Python environment if the system Python changed...
+When = PostTransaction
+Exec = /usr/lib/karamvt/setup-venv --if-python-changed

@@ -1,0 +1,24 @@
+# SPDX-FileCopyrightText: 2026 AbuKaram01
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+post_install() {
+    # A failure here must not abort the pacman transaction (the package files are already
+    # in place); say what to do instead.
+    if ! /usr/lib/karamvt/setup-venv; then
+        echo "==> WARNING: KaramVT's Python environment could not be set up."
+        echo "    Fix the cause (internet connection? C++ toolchain?) and run:"
+        echo "        sudo /usr/lib/karamvt/setup-venv"
+    fi
+    echo "==> First launch: open the menu and choose Download Models (or Preferences, Ctrl+,)"
+    echo "    to fetch a Whisper model and a translation model, or point KaramVT at ones you have."
+}
+
+# New app code was just installed: put it into the environment too.
+post_upgrade() {
+    post_install
+}
+
+post_remove() {
+    rm -rf /opt/karamvt/venv
+    rmdir /opt/karamvt 2>/dev/null || true
+}

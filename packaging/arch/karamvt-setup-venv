@@ -1,0 +1,52 @@
+#!/bin/sh
+# SPDX-FileCopyrightText: 2026 AbuKaram01
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# Creates (or rebuilds) KaramVT's private Python environment in /opt/karamvt/venv
+# and installs the app into it. Run by the package's install script and by the
+# pacman hook after a Python upgrade; safe to run by hand:
+#
+#     sudo /usr/lib/karamvt/setup-venv
+#
+#   (no argument)           create the environment if it is missing, and (re)install the app
+#   --if-python-changed     do nothing unless the system Python's minor version (3.13 -> 3.14)
+#                           differs from the one the environment was made with
+#
+# Needs internet access and a C++ toolchain: llama-cpp-python has no prebuilt wheel.
+# KARAMVT_APP_DIR / KARAMVT_PYTHON exist only so this can be tested away from /opt.
+set -eu
+
+APP_DIR="${KARAMVT_APP_DIR:-/opt/karamvt}"
+PYTHON="${KARAMVT_PYTHON:-python3}"
+VENV_DIR="$APP_DIR/venv"
+
+system_version="$("$PYTHON" -c 'import sys; print("%d.%d" % sys.version_info[:2])')"
+venv_version=""
+if [ -f "$VENV_DIR/pyvenv.cfg" ]; then
+    venv_version="$(sed -n 's/^version[[:space:]]*=[[:space:]]*\([0-9][0-9]*\.[0-9][0-9]*\).*/\1/p' "$VENV_DIR/pyvenv.cfg" | head -n 1)"
+fi
+
+if [ "${1:-}" = "--if-python-changed" ]; then
+    [ -d "$VENV_DIR" ] || exit 0
+    [ "$venv_version" = "$system_version" ] && exit 0
+    echo ":: KaramVT: the system Python changed (${venv_version:-unknown} -> $system_version); rebuilding its environment."
+fi
+
+# An environment made by a different Python can't be reused (its packages live in a
+# version-specific folder), so start over rather than patch it up.
+if [ -d "$VENV_DIR" ] && [ "$venv_version" != "$system_version" ]; then
+    rm -rf "$VENV_DIR"
+fi
+
+variant="$(cat "$APP_DIR/variant" 2>/dev/null || echo cpu)"
+
+echo ":: KaramVT: setting up its Python environment (needs internet access and a C++ toolchain;"
+echo "   the first time can take several minutes - llama-cpp-python is compiled from source)."
+[ -d "$VENV_DIR" ] || "$PYTHON" -m venv --system-site-packages "$VENV_DIR"
+"$VENV_DIR/bin/pip" install --upgrade pip --quiet
+if [ "$variant" = "cuda" ]; then
+    CMAKE_ARGS="-DGGML_CUDA=on"
+    export CMAKE_ARGS
+fi
+"$VENV_DIR/bin/pip" install --quiet "$APP_DIR/src"
+echo ":: KaramVT is ready. Find it in your applications menu, or run: karamvt-gui"

@@ -1,0 +1,112 @@
+# SPDX-FileCopyrightText: 2026 AbuKaram01
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Maintainer: AbuKaram01 <AbuKaram01@users.noreply.github.com>
+#
+# Two packages from one source: karamvt (CPU) and karamvt-cuda (CUDA-accelerated translation).
+#
+# Local builds: packaging/build-arch.sh makes the source tarball from your checkout (laid out
+# like GitHub's release archive) and runs makepkg here. For the AUR, tag a release on GitHub,
+# replace 'SKIP' with the tarball's sha256 (makepkg -g) and generate .SRCINFO with:
+#     makepkg --printsrcinfo > .SRCINFO
+#
+# Like the .deb/.rpm, no Python dependencies are bundled: on install, a private venv is
+# created in /opt/karamvt/venv and the app is pip-installed there. That needs internet access
+# and a C++ toolchain (llama-cpp-python is compiled from source). It is redone automatically
+# when Arch upgrades Python to a new minor version (see karamvt.hook), since a venv can't
+# survive that.
+#
+# Keep pkgver in sync with __version__ in src/karamvt/__init__.py (build-arch.sh checks).
+
+pkgbase=karamvt
+pkgname=('karamvt' 'karamvt-cuda')
+pkgver=0.1.0
+pkgrel=1
+pkgdesc='Karam Video Translator - offline video, text & OCR translator'
+arch=('x86_64')
+url='https://github.com/AbuKaram01/KaramVT'
+license=('AGPL-3.0-or-later')
+options=('!strip' '!debug')
+makedepends=('python')
+# GitHub names the folder inside a release archive after the repository, not the package.
+_srcdir="KaramVT-$pkgver"
+source=("$pkgbase-$pkgver.tar.gz::$url/archive/v$pkgver.tar.gz")
+sha256sums=('SKIP')
+
+_depends=(
+    'python'
+    'python-pip'
+    'python-gobject'
+    'gtk4'
+    'libadwaita'
+    'librsvg'
+    'adwaita-icon-theme'
+    # needed at install time to compile llama-cpp-python
+    'gcc'
+    'make'
+    'cmake'
+    # OCR (Import from image); osd = script/orientation detection for Auto-detect
+    'tesseract'
+    'tesseract-data-eng'
+    'tesseract-data-osd'
+)
+_optdepends=(
+    'tesseract-data-ara: OCR for Arabic'
+    'tesseract-data-fra: OCR for French'
+    'tesseract-data-deu: OCR for German'
+    'tesseract-data-spa: OCR for Spanish'
+)
+
+check() {
+    cd "$srcdir/$_srcdir"
+    python -m compileall -q src
+}
+
+# Everything both packages share. $1 = variant (cpu|cuda), recorded in /opt/karamvt/variant
+# so the shared setup script knows whether to build llama-cpp-python with CUDA.
+_package_files() {
+    local root="$srcdir/$_srcdir" app_id=io.github.AbuKaram01.KaramVT
+
+    # pip builds from this folder, so everything pyproject.toml refers to must be here.
+    install -d "$pkgdir/opt/karamvt/src"
+    cp -r "$root/src" "$root/pyproject.toml" "$root/LICENSE" "$pkgdir/opt/karamvt/src/"
+    find "$pkgdir/opt/karamvt/src" -name '__pycache__' -type d -prune -exec rm -rf {} +
+    printf '%s\n' "$1" > "$pkgdir/opt/karamvt/variant"
+
+    install -d "$pkgdir/usr/bin"
+    cat > "$pkgdir/usr/bin/karamvt-gui" << 'LAUNCHER'
+#!/bin/sh
+# A package always installs to the same place, so this path is always right.
+exec /opt/karamvt/venv/bin/python3 -m karamvt.gui "$@"
+LAUNCHER
+    chmod 755 "$pkgdir/usr/bin/karamvt-gui"
+
+    install -Dm644 "$root/data/$app_id.desktop" "$pkgdir/usr/share/applications/$app_id.desktop"
+    install -d "$pkgdir/usr/share/icons"
+    cp -r "$root/data/icons/hicolor" "$pkgdir/usr/share/icons/"
+
+    install -Dm755 "$root/packaging/arch/karamvt-setup-venv" "$pkgdir/usr/lib/karamvt/setup-venv"
+    install -Dm644 "$root/packaging/arch/karamvt.hook" "$pkgdir/usr/share/libalpm/hooks/karamvt-python.hook"
+    install -Dm644 "$root/LICENSE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+
+    # whatever umask the archive was unpacked under: dirs 755, files 644 (scripts above are 755)
+    find "$pkgdir/opt" "$pkgdir/usr/share/icons" -type d -exec chmod 755 {} +
+    find "$pkgdir/opt" "$pkgdir/usr/share/icons" -type f -exec chmod 644 {} +
+}
+
+package_karamvt() {
+    depends=("${_depends[@]}")
+    optdepends=("${_optdepends[@]}")
+    conflicts=('karamvt-cuda')
+    install=karamvt.install
+    _package_files cpu
+}
+
+package_karamvt-cuda() {
+    pkgdesc="$pkgdesc (CUDA-accelerated translation)"
+    depends=("${_depends[@]}" 'cuda')
+    optdepends=("${_optdepends[@]}")
+    provides=("karamvt=$pkgver")
+    conflicts=('karamvt')
+    install=karamvt.install
+    _package_files cuda
+}

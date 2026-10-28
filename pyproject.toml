@@ -1,0 +1,65 @@
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "KaramVT"
+version = "0.1.0"
+description = "Generate and translate video subtitles, translate text, and extract text from images, fully offline, using local Whisper and LLM models."
+authors = [{ name = "AbuKaram01" }]
+license = "AGPL-3.0-or-later"
+license-files = ["LICENSE"]
+requires-python = ">=3.10"
+dependencies = [
+    "faster-whisper",
+    # faster-whisper decodes audio with PyAV and calls av.open(..., metadata_errors=...),
+    # an argument PyAV removed in 19.0 — with a newer PyAV every transcription fails with
+    # "open() got an unexpected keyword argument 'metadata_errors'". faster-whisper only
+    # declares "av>=11", so pip picks the newest PyAV unless it is capped here. Remove the
+    # cap once a faster-whisper release newer than 1.2.1 (which handles PyAV 19) is out.
+    "av>=11,<19",
+    "llama-cpp-python",
+    "langdetect",
+    "pytesseract",
+    "Pillow",
+    # PyGObject is best installed as a system package on Linux (see README)
+    # rather than through pip — it binds to your system's GTK/GObject-
+    # Introspection libraries, which pip alone cannot provide.
+    # On Windows there is no wheel on PyPI and the sdist cannot be built by pip alone; the
+    # gvsbuild-built wheel is installed by scripts/install-windows.ps1 instead.
+    "PyGObject; sys_platform != 'win32'",
+]
+
+[project.scripts]
+karamvt-gui = "karamvt.gui.application:main"
+
+[project.optional-dependencies]
+dev = ["pytest", "ruff"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+# E and W: pycodestyle, F: pyflakes, D: pydocstyle (the docstrings of the public API in src/).
+select = ["E", "F", "W", "D"]
+ignore = [
+    "D105",  # Magic methods are documented by the protocol they implement.
+    "D107",  # The arguments of __init__ are described in the docstring of the class.
+]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.lint.per-file-ignores]
+# GTK has to be told which version to load before gi.repository is imported, so these imports cannot come first.
+"src/karamvt/gui/**" = ["E402"]
+# A test describes itself by its name; docstrings are optional there.
+"tests/**" = ["D"]

@@ -1,0 +1,624 @@
+# SPDX-FileCopyrightText: 2026 AbuKaram01
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+# Continuous integration.
+#
+#   Every push and pull request:  linux, windows-core, windows-gtk, installer
+#   Manual only (Actions > CI > Run workflow):  windows-installer-run, windows-full-install
+
+name: CI
+
+on:
+  push:
+  pull_request:
+  # The manual run starts only the two jobs marked "Manual only" below.
+  workflow_dispatch:
+
+jobs:
+  # The whole test suite on Linux, GUI tests included (GTK runs under a virtual display).
+  linux:
+    if: github.event_name != 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: System packages
+        run: >-
+          sudo apt-get update &&
+          sudo apt-get install -y python3-gi gir1.2-gtk-4.0 gir1.2-adw-1 xvfb adwaita-icon-theme
+      - name: Python environment
+        run: |
+          python3 -m venv --system-site-packages .venv
+          .venv/bin/pip install pytest pillow pytesseract
+          .venv/bin/pip install --no-deps -e .
+      - run: GSK_RENDERER=cairo xvfb-run -a .venv/bin/pytest -q
+
+  # The engine, storage, paths, OCR and the Windows support code, without GTK: catches path, encoding and
+  # file-locking mistakes on a real Windows file system. The GUI tests skip themselves here.
+  windows-core:
+    if: github.event_name != 'workflow_dispatch'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install pytest pillow pytesseract
+      - run: pip install --no-deps -e .
+      - run: pytest -q
+
+  # The real thing: installs the GTK runtime with scripts/install-windows.ps1 (heavy packages skipped) and runs
+  # the whole suite, GUI tests included, against GTK 4 and libadwaita on Windows. The Python version has to be
+  # the one the gvsbuild PyGObject wheel was built for. The install script takes the release named in
+  # scripts/gtk-portable.ps1 (2026.8.0: wheels for 3.14), not the newest one: gvsbuild 2026.10.0 builds its wheels for
+  # Python 3.15. When you move to a newer release, change that tag and this Python version together; if this job fails
+  # with "are for Python x.y", that is the mismatch.
+  windows-gtk:
+    if: github.event_name != 'workflow_dispatch'
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.14"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install GTK and the Python environment
+        shell: pwsh
+        run: ./scripts/install-windows.ps1 -SkipHeavy -NoShortcut -PythonVersion ${{ matrix.python }}
+      - name: Test
+        shell: pwsh
+        run: .venv\Scripts\python.exe -m pytest -q
+
+  # Builds the Windows installer and checks what went into it: Tesseract, the GTK runtime, the Python installer and
+  # the Python libraries (the wheelhouse). The installer is kept as a build artifact. It waits for the cheaper
+  # windows-core job, so a broken Windows code base does not cost a build.
+  installer:
+    if: github.event_name != 'workflow_dispatch'
+    runs-on: windows-latest
+    needs: windows-core
+    steps:
+      - uses: actions/checkout@v4
+      # The Python libraries inside the installer are collected with the Python of the GTK runtime.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - name: Install Inno Setup
+        shell: pwsh
+        run: choco install innosetup --no-progress -y
+      - name: Build the installer (the runner has 7-Zip, so a portable Tesseract goes inside, and so do GTK,
+          the Python installer and the Python libraries)
+        shell: pwsh
+        env:
+          # Lifts the API rate limit for the digest lookup of the GTK zip.
+          GITHUB_TOKEN: ${{ github.token }}
+        run: ./packaging/build-windows.ps1 -RequirePython -RequireVcRuntime
+      - name: The installer carries a working Tesseract
+        shell: pwsh
+        run: |
+          $exe = 'packaging\tesseract\tesseract.exe'
+          if (-not (Test-Path $exe)) { throw 'The portable Tesseract was not prepared.' }
+          & $exe --version
+          if ($LASTEXITCODE -ne 0) { throw 'tesseract.exe does not start.' }
+          & $exe --list-langs
+          $setup = Get-ChildItem packaging\dist\*.exe | Select-Object -First 1
+          "{0}: {1:N1} MB" -f $setup.Name, ($setup.Length / 1MB)
+          if ($setup.Length -lt 20MB) { throw 'The installer is too small to contain Tesseract.' }
+      - name: The installer carries the GTK runtime
+        shell: pwsh
+        run: |
+          . ./scripts/gtk-portable.ps1
+          if (-not (Test-GtkRuntime 'packaging\gtk')) { throw 'The GTK runtime was not prepared.' }
+          Get-Content packaging\gtk\gvsbuild-release.txt
+          if (-not (Get-ChildItem packaging\gtk\wheels -Filter 'pygobject*.whl')) {
+              throw 'The runtime has no PyGObject wheel.'
+          }
+          $size = (Get-ChildItem packaging\gtk -Recurse -File | Measure-Object Length -Sum).Sum
+          "GTK runtime: {0:N0} MB unpacked" -f ($size / 1MB)
+          $setup = Get-ChildItem packaging\dist\*.exe | Select-Object -First 1
+          "{0}: {1:N1} MB" -f $setup.Name, ($setup.Length / 1MB)
+          if ($setup.Length -lt $size / 8) { throw 'The installer is too small to contain the GTK runtime.' }
+      - name: The installer carries the Python installer and the Python libraries
+        shell: pwsh
+        run: |
+          . ./scripts/python-bundle.ps1
+          $minor = Get-GtkPythonMinor 'packaging\gtk'
+          "Python of the GTK runtime: $minor"
+          $pythonSetup = Find-PythonInstaller 'packaging\python' $minor
+          if (-not $pythonSetup) { throw "The Python $minor installer was not prepared (packaging\python)." }
+          "{0}: {1:N1} MB" -f (Split-Path $pythonSetup -Leaf), ((Get-Item $pythonSetup).Length / 1MB)
+          if (-not (Test-Wheelhouse 'packaging\wheelhouse' $minor)) {
+              throw 'The Python libraries were not prepared (packaging\wheelhouse).'
+          }
+          $wheels = @(Get-ChildItem packaging\wheelhouse -Filter '*.whl')
+          $size = ($wheels | Measure-Object Length -Sum).Sum
+          "{0} wheels, {1:N0} MB" -f $wheels.Count, ($size / 1MB)
+          $setup = Get-ChildItem packaging\dist\*.exe | Select-Object -First 1
+          "{0}: {1:N1} MB" -f $setup.Name, ($setup.Length / 1MB)
+          if ($setup.Length -lt $size / 8) { throw 'The installer is too small to contain the Python libraries.' }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: karamvt-windows-setup
+          path: packaging/dist/*.exe
+
+  # Manual only. Builds the installer and runs it the way a user would (silently), then checks that GTK came from
+  # inside the installer (nothing is downloaded into %LOCALAPPDATA%\karamvt\gtk), that GTK loads and the application
+  # stays up, and that running the installer again over the first installation (an upgrade) keeps the user's data
+  # and leaves a working program.
+  windows-installer-run:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: windows-latest
+    timeout-minutes: 60
+    env:
+      GITHUB_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - name: Install Inno Setup
+        shell: pwsh
+        run: choco install innosetup --no-progress -y
+      - name: Build the installer
+        shell: pwsh
+        run: ./packaging/build-windows.ps1 -RequirePython -RequireVcRuntime
+      - name: Run the installer (silently, as a user would, on a machine whose Python is not there for it to use)
+        shell: pwsh
+        timeout-minutes: 35
+        run: |
+          # The runner's Python (setup-python, above) was only needed to build the installer. Taking it off the PATH
+          # and out of the registry (where the py launcher looks) leaves the Python installer inside setup.exe as the
+          # only way to get Python 3.14, which is what a user without Python has.
+          $env:PATH = ($env:PATH -split ';' | Where-Object { $_ -and $_ -notlike '*hostedtoolcache*Python*' }) -join ';'
+          $registryKeys = 'HKLM:\SOFTWARE\Python\PythonCore\3.14',
+                          'HKLM:\SOFTWARE\WOW6432Node\Python\PythonCore\3.14',
+                          'HKCU:\SOFTWARE\Python\PythonCore\3.14'
+          foreach ($key in $registryKeys) {
+            if (Test-Path $key) { "Removing $key"; Remove-Item $key -Recurse -Force }
+          }
+          $left = Get-Command python -ErrorAction SilentlyContinue
+          if ($left) { "Still on the PATH: $($left.Source)" } else { 'No Python on the PATH.' }
+          if (Get-Command py -ErrorAction SilentlyContinue) {
+            'The py launcher knows:'
+            & py -0p 2>&1 | Out-Host
+            $global:LASTEXITCODE = 0
+          }
+          ./packaging/windows/run-installer.ps1 -Label first
+      - name: Check the installation (Python and its libraries came from inside the installer)
+        shell: pwsh
+        run: ./packaging/windows/check-installed.ps1 -ExpectBundledPython
+      - name: Put something of the user's where an upgrade must not touch it
+        shell: pwsh
+        run: |
+          $models = Join-Path $env:LOCALAPPDATA 'karamvt\models'
+          New-Item -ItemType Directory -Force $models | Out-Null
+          Set-Content (Join-Path $models 'keep-me.txt') 'the user''s data'
+      - name: Run the installer again over the first installation (an upgrade)
+        shell: pwsh
+        timeout-minutes: 35
+        run: ./packaging/windows/run-installer.ps1 -Label second
+      - name: Check the upgraded installation
+        shell: pwsh
+        run: |
+          $keepMe = Join-Path $env:LOCALAPPDATA 'karamvt\models\keep-me.txt'
+          if (-not (Test-Path $keepMe)) { throw "The upgrade removed the user's data." }
+          # Same Python, so the Python environment of the first installation is reused, not made again.
+          $log = Get-Content (Join-Path $env:LOCALAPPDATA 'karamvt\install.log') -Raw
+          if ($log -match 'recreating it') {
+              throw 'The upgrade recreated the Python environment although Python had not changed.'
+          }
+          ./packaging/windows/check-installed.ps1
+      # This runner has the Visual C++ Redistributable, so the program starting here proves nothing about a machine
+      # that lacks it. Two steps cover that. Both run on the upgraded installation, and even when an earlier step
+      # failed, so that the rest of the job still reports.
+      #   - The first reads the import tables of every program file and fails when a DLL that the program needs is
+      #     provided by nothing in the installation (msvcp140.dll ... come from the vcruntime folder the installer
+      #     carries).
+      #   - The second imports the libraries the way the program does and fails when a Visual C++ runtime DLL was
+      #     loaded from the machine instead of from the installation.
+      # libcrypto-3-x64.dll and libssl-3-x64.dll are imported by llama-common.dll, a helper library of llama.cpp that
+      # the program does not load (the second step lists what it loads, and importing llama_cpp works without them).
+      - name: Which DLLs does the installed program need from the machine? (import tables)
+        if: ${{ !cancelled() }}
+        shell: pwsh
+        env:
+          PYTHONUTF8: "1"
+        run: |
+          $app = Join-Path $env:LOCALAPPDATA 'Programs\KaramVT'
+          & "$app\.venv\Scripts\python.exe" -I packaging\windows\dlls.py scan --app $app --strict `
+              --allow libcrypto-3-x64.dll --allow libssl-3-x64.dll `
+              --json "$env:RUNNER_TEMP\dll-scan.json" --github
+          if ($LASTEXITCODE -ne 0) {
+              throw ("Something the installed program needs is provided by nothing in the installation, or the " +
+                     "scan failed (exit code $LASTEXITCODE); the list is above.")
+          }
+      - name: Where do the Visual C++ runtime DLLs of the running program come from?
+        if: ${{ !cancelled() }}
+        shell: pwsh
+        env:
+          PYTHONUTF8: "1"
+        run: |
+          $app = Join-Path $env:LOCALAPPDATA 'Programs\KaramVT'
+          & "$app\.venv\Scripts\python.exe" packaging\windows\dlls.py loaded --app $app --strict
+          if ($LASTEXITCODE -ne 0) {
+              throw ("A library failed to import or a Visual C++ runtime DLL came from the machine instead of the " +
+                     "installation (exit code $LASTEXITCODE); the list is above.")
+          }
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: dll-scan
+          path: ${{ runner.temp }}/dll-scan.json
+          if-no-files-found: ignore
+
+  # Manual only (several minutes of Windows time, so it never runs on a push). The complete installation with
+  # nothing skipped: faster-whisper, llama-cpp-python (prebuilt wheel or compiled), Tesseract, the Start menu entry;
+  # then it checks the heavy libraries import, reads a picture with the real Tesseract (the language folder has a
+  # space in its path, like a Windows user name often does), and launches the application the way the Start menu
+  # entry does (pythonw.exe, with and without the software renderer), keeping a screenshot of each.
+  windows-full-install:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - name: Install everything
+        id: install
+        shell: pwsh
+        run: ./scripts/install-windows.ps1 -PythonVersion 3.14
+      - name: The heavy libraries import
+        shell: pwsh
+        run: >
+          .venv\Scripts\python.exe -c "import sys, av, ctranslate2, faster_whisper, langdetect, llama_cpp,
+          pytesseract, PIL;
+          print('python', sys.version); print('av', av.__version__); print('ctranslate2', ctranslate2.__version__);
+          print('faster-whisper', faster_whisper.__version__); print('llama-cpp-python', llama_cpp.__version__)"
+      - name: The Start menu entry points at something that exists
+        shell: pwsh
+        run: |
+          $link = Join-Path ([Environment]::GetFolderPath('Programs')) 'KaramVT.lnk'
+          if (-not (Test-Path $link)) { throw "Start menu entry missing: $link" }
+          $shortcut = (New-Object -ComObject WScript.Shell).CreateShortcut($link)
+          "Target:    $($shortcut.TargetPath)"
+          "Arguments: $($shortcut.Arguments)"
+          "Icon:      $($shortcut.IconLocation)"
+          if (-not (Test-Path $shortcut.TargetPath)) { throw 'The shortcut target does not exist.' }
+      - name: OCR with the real Tesseract
+        shell: pwsh
+        run: |
+          # The install script unpacked a portable Tesseract (the runner has 7-Zip and no winget): the application
+          # has to find it by itself.
+          $tessdata = Join-Path $env:LOCALAPPDATA 'karamvt\tesseract\tessdata'
+          $packs = Join-Path $env:RUNNER_TEMP 'Ali Hassan\karamvt\tessdata\fast'
+          New-Item -ItemType Directory -Force $packs | Out-Null
+          Copy-Item (Join-Path $tessdata 'eng.traineddata') $packs
+          Copy-Item (Join-Path $tessdata 'osd.traineddata') $packs
+          $env:XDG_DATA_HOME = Join-Path $env:RUNNER_TEMP 'Ali Hassan'
+          @'
+          import sys
+          from PIL import Image, ImageDraw, ImageFont
+          from karamvt.core import ocr, tessdata_manager
+          from karamvt.core.languages import language_for_code
+
+          status = ocr.check_engine()
+          print("engine:", status)
+          assert status.ok, "tesseract was not found or would not run"
+          found = ocr.find_tesseract()
+          print("program:", found)
+          assert found and "karamvt" in found.lower(), "KaramVT should be using its own unpacked copy of tesseract.exe"
+          assert " " in str(tessdata_manager.APP_DATA_DIR), "the language folder should contain a space"
+
+          image = Image.new("RGB", (900, 160), "white")
+          ImageDraw.Draw(image).text(
+              (20, 40), "Hello KaramVT 12345", fill="black", font=ImageFont.load_default(size=64)
+          )
+          image.save("ocr-sample.png")
+
+          for source in ("system", "fast"):
+              result = ocr.OcrEngine(on_progress=print).extract_text(
+                  "ocr-sample.png", language=language_for_code("en"), language_source=source)
+              print(source, "->", repr(result.text), result.confidence, result.notice)
+              assert "Hello" in result.text, f"nothing readable with the {source} language folder"
+          print("OCR works with the program outside PATH and a language folder that has a space")
+          '@ | Set-Content ocr_smoke.py -Encoding utf8
+          .venv\Scripts\python.exe ocr_smoke.py
+      - name: The Tesseract row finds whatever OCR would run
+        shell: pwsh
+        run: |
+          # OCR Settings says whether Tesseract is installed from karamvt.core.ocr.find_tesseract(); OCR itself uses the
+          # same lookup and, when it finds nothing, lets pytesseract run a plain "tesseract", which Windows finds by its
+          # own rules. If the two ever disagree, the row asks for an installation of a program that is working. Here the
+          # copy is somewhere nothing of KaramVT's points to, and on PATH only as a quoted folder (with a space in it),
+          # which Python's search and Windows' may read differently. Either may find it; they must agree.
+          $odd = Join-Path $env:RUNNER_TEMP 'odd place (quoted on PATH)'
+          New-Item -ItemType Directory -Force $odd | Out-Null
+          Copy-Item (Join-Path $env:LOCALAPPDATA 'karamvt\tesseract\*') $odd -Recurse
+          $empty = Join-Path $env:RUNNER_TEMP 'nothing-here'
+          New-Item -ItemType Directory -Force $empty | Out-Null
+          $env:LOCALAPPDATA = $empty
+          $env:XDG_DATA_HOME = $empty
+          $env:ProgramFiles = $empty
+          ${env:ProgramFiles(x86)} = $empty
+          $env:PATH = "`"$odd`";" +
+              (($env:PATH -split ';' | Where-Object { $_ -and $_ -notlike '*Tesseract*' }) -join ';')
+          @'
+          import shutil
+          import subprocess
+          import sys
+
+          from karamvt.core import ocr
+
+          which = shutil.which("tesseract")
+          try:
+              version = subprocess.run(["tesseract", "--version"], capture_output=True, text=True, timeout=60)
+              plain = version.returncode == 0
+          except OSError:
+              plain = False
+          found = ocr.find_tesseract()
+          status = ocr.check_engine()
+          print("shutil.which finds              :", which)
+          print("a plain 'tesseract' (as pytesseract runs it) starts:", plain)
+          print("find_tesseract finds            :", found)
+          print(
+              "OCR Settings shows              :",
+              ("installed, version " + str(status.version))
+              if status.ok
+              else ("NOT installed: " + str(status.problem or status.searched)),
+          )
+          if plain and not status.ok:
+              sys.exit("OCR can run a plain 'tesseract' but OCR Settings says it is not installed.")
+          '@ | Set-Content agree.py -Encoding utf8
+          .venv\Scripts\python.exe agree.py
+          if ($LASTEXITCODE -ne 0) { throw 'OCR Settings and OCR disagree about whether Tesseract is there.' }
+      - name: Tesseract on its own, with Arabic letters in each path (a report; never red)
+        shell: pwsh
+        run: |
+          # tesseract.exe is an ANSI program: it may not take Arabic letters in the paths on its command line. This
+          # step only reports whether it does on this machine; the next one checks what KaramVT does about it.
+          $portable = Join-Path $env:LOCALAPPDATA 'karamvt\tesseract'
+          $arabic = Join-Path $env:RUNNER_TEMP ([string]::Join('', [char[]](0x0623, 0x062D, 0x0645, 0x062F)))
+          $plain = Join-Path $env:RUNNER_TEMP 'plain'
+          New-Item -ItemType Directory -Force $arabic, $plain | Out-Null
+          Copy-Item $portable (Join-Path $arabic 'tesseract') -Recurse
+          @'
+          from PIL import Image, ImageDraw, ImageFont
+          import sys
+          image = Image.new("RGB", (900, 160), "white")
+          ImageDraw.Draw(image).text((20, 40), "Hello 12345", fill="black", font=ImageFont.load_default(size=64))
+          image.save(sys.argv[1])
+          '@ | Set-Content make_sample.py -Encoding utf8
+          .venv\Scripts\python.exe make_sample.py (Join-Path $plain 'in.png')
+          .venv\Scripts\python.exe make_sample.py (Join-Path $arabic 'in.png')
+
+          # Runs tesseract.exe (from $WorkingFolder, when given) and returns the text it wrote, '' if it wrote none.
+          function Run-Case([string]$Exe, [string]$In, [string]$Out, [string]$WorkingFolder) {
+              if ($WorkingFolder) { Push-Location -LiteralPath $WorkingFolder }
+              try { & $Exe $In $Out -l eng 2>&1 | Out-Null } finally { if ($WorkingFolder) { Pop-Location } }
+              # A Tesseract that cannot use a path is a result here, not the step's exit code.
+              $global:LASTEXITCODE = 0
+              $resolved = if ([IO.Path]::IsPathRooted($Out)) { $Out } else { Join-Path $WorkingFolder $Out }
+              # Get-Content -Raw on an empty file returns nothing (not an empty string), so it must not be piped to
+              # .Trim() unchecked: Tesseract leaves an empty file behind when it cannot use a path, and that is a
+              # result, not an error.
+              $text = ''
+              if (Test-Path -LiteralPath "$resolved.txt") {
+                  $raw = Get-Content -LiteralPath "$resolved.txt" -Raw
+                  if ($raw) { $text = $raw.Trim() }
+              }
+              return $text
+          }
+
+          $program = Join-Path $portable 'tesseract.exe'
+          $arabicProgram = Join-Path $arabic 'tesseract\tesseract.exe'
+          $picture = Join-Path $plain 'in.png'
+          $arabicPicture = Join-Path $arabic 'in.png'
+          $cases = [ordered]@{
+              'program in an Arabic folder' = @($arabicProgram, $picture, (Join-Path $plain 'out1'), '')
+              'picture in an Arabic folder' = @($program, $arabicPicture, (Join-Path $plain 'out2'), '')
+              'output in an Arabic folder'  = @($program, $picture, (Join-Path $arabic 'out3'), '')
+          }
+          foreach ($name in $cases.Keys) {
+              $exe, $in, $out, $folder = $cases[$name]
+              $text = Run-Case $exe $in $out $folder
+              $verdict = if ($text -match 'Hello') { 'works' } else { 'does not work (a limit of Tesseract)' }
+              "{0,-46} {1}   {2}" -f $name, $verdict, $text
+          }
+      - name: What KaramVT does about Arabic letters in the paths
+        shell: pwsh
+        run: |
+          # KaramVT never gives tesseract.exe such a path (src/karamvt/core/ascii_paths.py). Counted: what it relies
+          # on instead.
+          $portable = Join-Path $env:LOCALAPPDATA 'karamvt\tesseract'
+          $arabic = Join-Path $env:RUNNER_TEMP ([string]::Join('', [char[]](0x0623, 0x062D, 0x0645, 0x062F)))
+          $plain = Join-Path $env:RUNNER_TEMP 'plain'
+          New-Item -ItemType Directory -Force $arabic, $plain | Out-Null
+          @'
+          from PIL import Image, ImageDraw, ImageFont
+          import sys
+          image = Image.new("RGB", (900, 160), "white")
+          ImageDraw.Draw(image).text((20, 40), "Hello 12345", fill="black", font=ImageFont.load_default(size=64))
+          image.save(sys.argv[1])
+          '@ | Set-Content make_sample.py -Encoding utf8
+          .venv\Scripts\python.exe make_sample.py (Join-Path $plain 'in.png')
+          .venv\Scripts\python.exe make_sample.py (Join-Path $arabic 'in.png')
+
+          function Run-Case([string]$Exe, [string]$In, [string]$Out, [string]$WorkingFolder) {
+              Push-Location -LiteralPath $WorkingFolder
+              try { & $Exe $In $Out -l eng 2>&1 | Out-Null } finally { Pop-Location }
+              # A Tesseract that cannot use a path is a result here, not the step's exit code.
+              $global:LASTEXITCODE = 0
+              $text = ''
+              if (Test-Path -LiteralPath (Join-Path $WorkingFolder "$Out.txt")) {
+                  $raw = Get-Content -LiteralPath (Join-Path $WorkingFolder "$Out.txt") -Raw
+                  if ($raw) { $text = $raw.Trim() }
+              }
+              return $text
+          }
+
+          $failed = @()
+          # Started inside an Arabic folder and given relative ASCII names: the folder reaches Windows as UTF-16, not
+          # through Tesseract's command line.
+          $text = Run-Case (Join-Path $portable 'tesseract.exe') 'in.png' 'out4' $arabic
+          $verdict = if ($text -match 'Hello') { 'works' } else { 'FAILS' }
+          "{0,-46} {1}   {2}" -f 'started in an Arabic folder, relative names', $verdict, $text
+          if ($text -notmatch 'Hello') { $failed += 'started in an Arabic folder, relative names' }
+
+          # A program in an Arabic folder is started by its 8.3 short name (only where the volume keeps short names).
+          # The step before made a copy of the program there: replace it.
+          Remove-Item (Join-Path $arabic 'tesseract') -Recurse -Force -ErrorAction SilentlyContinue
+          Copy-Item $portable (Join-Path $arabic 'tesseract') -Recurse
+          $arabicProgram = Join-Path $arabic 'tesseract\tesseract.exe'
+          $short = (New-Object -ComObject Scripting.FileSystemObject).GetFile($arabicProgram).ShortPath
+          if ($short -match '[^\x00-\x7F]') {
+              "{0,-46} {1}" -f 'program by its 8.3 short name', 'not tried: this volume keeps no 8.3 names'
+          } else {
+              $text = Run-Case $short (Join-Path $plain 'in.png') 'out5' $plain
+              $verdict = if ($text -match 'Hello') { 'works' } else { 'FAILS' }
+              "{0,-46} {1}   {2}" -f 'program by its 8.3 short name', $verdict, $text
+              if ($text -notmatch 'Hello') { $failed += 'program by its 8.3 short name' }
+          }
+
+          # The application itself: TEMP, the picture, the program and the language folder all have Arabic letters.
+          $packs = Join-Path $arabic 'karamvt\tessdata\fast'
+          New-Item -ItemType Directory -Force $packs | Out-Null
+          Copy-Item (Join-Path $portable 'tessdata\eng.traineddata') $packs
+          Copy-Item (Join-Path $portable 'tessdata\osd.traineddata') $packs
+          Copy-Item $portable (Join-Path $arabic 'karamvt\tesseract') -Recurse
+          New-Item -ItemType Directory -Force (Join-Path $arabic 'Temp') | Out-Null
+          $env:ARABIC_FOLDER = $arabic
+          $env:XDG_DATA_HOME = $arabic
+          $env:TEMP = Join-Path $arabic 'Temp'
+          $env:TMP = $env:TEMP
+          @'
+          import os, sys
+          from PIL import Image, ImageDraw, ImageFont
+          from karamvt.core import ascii_paths, ocr, tessdata_manager
+          from karamvt.core.languages import language_for_code
+
+          # The console of a Windows runner is cp1252: printing a path with Arabic letters would stop the script.
+          sys.stdout.reconfigure(errors="backslashreplace")
+          arabic = os.environ["ARABIC_FOLDER"]
+          assert not os.environ["TEMP"].isascii(), "TEMP should have Arabic letters"
+          found = ocr.find_tesseract()
+          print("program:", found)
+          assert found and not found.isascii(), (
+              "the copy of tesseract.exe in the Arabic folder should be the one in use"
+          )
+          assert not str(tessdata_manager.local_tessdata_dir("fast")).isascii(), (
+              "the language folder should have Arabic letters"
+          )
+          print("short name of the program:", ascii_paths.short_path(found))
+
+          sample = os.path.join(arabic, "صفحة.png")
+          image = Image.new("RGB", (1400, 160), "white")
+          ImageDraw.Draw(image).text(
+              (20, 40),
+              "Hello KaramVT, the quick brown fox 12345",
+              fill="black",
+              font=ImageFont.load_default(size=64),
+          )
+          image.save(sample)
+
+          # A paragraph, because script detection needs more text than the line above to guess well.
+          paragraph = os.path.join(arabic, "فقرة.png")
+          image = Image.new("RGB", (1500, 420), "white")
+          for number in range(4):
+              ImageDraw.Draw(image).text(
+                  (20, 20 + number * 95),
+                  "The quick brown fox jumps over the lazy dog",
+                  fill="black",
+                  font=ImageFont.load_default(size=56),
+              )
+          image.save(paragraph)
+
+          for source in ("system", "fast"):
+              result = ocr.OcrEngine(on_progress=print).extract_text(
+                  sample, language=language_for_code("en"), language_source=source
+              )
+              print(source, "English chosen ->", repr(result.text), result.confidence)
+              assert "Hello" in result.text, f"nothing readable with the {source} language data"
+
+              # No language chosen: the script is detected first. That has to run with these paths; which script it
+              # guesses on a synthetic picture does not matter here.
+              try:
+                  result = ocr.OcrEngine(on_progress=print).extract_text(
+                      paragraph, language=None, language_source=source
+                  )
+                  notice = result.notice or ""
+                  print(source, "auto-detect ->", repr(result.text[:40]), notice)
+                  assert "script detection failed" not in notice, (
+                      f"script detection did not run with the {source} language data"
+                  )
+              except RuntimeError as error:
+                  # It ran and guessed a script whose language pack is not in this folder: fine here.
+                  print(source, "auto-detect ->", str(error).splitlines()[0])
+                  assert "osd" not in str(error).lower(), (
+                      f"script detection could not load its data with the {source} language folder"
+                  )
+          print("OCR works with Arabic letters in TEMP, the picture, the program and the language folder")
+          '@ | Set-Content ocr_arabic_smoke.py -Encoding utf8
+          .venv\Scripts\python.exe ocr_arabic_smoke.py
+          if ($LASTEXITCODE -ne 0) { $failed += 'the application reading a picture with Arabic letters in every path' }
+          if ($failed) { throw ("What KaramVT relies on does not work here: " + ($failed -join '; ')) }
+      - name: Test suite with the real libraries installed
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        shell: pwsh
+        run: |
+          .venv\Scripts\python.exe -m pip install --quiet pytest
+          .venv\Scripts\python.exe -m pytest -q
+      - name: Launch the application
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force screenshots | Out-Null
+          Add-Type -AssemblyName System.Windows.Forms, System.Drawing
+          $python = (Resolve-Path .venv\Scripts\pythonw.exe).Path
+          $failed = $false
+          foreach ($renderer in 'default', 'cairo') {
+              if ($renderer -eq 'cairo') {
+                  $env:GSK_RENDERER = 'cairo'
+              } else {
+                  Remove-Item Env:GSK_RENDERER -ErrorAction SilentlyContinue
+              }
+              $process = Start-Process -FilePath $python -ArgumentList '-m', 'karamvt.gui' -PassThru
+              Start-Sleep -Seconds 20
+              if ($process.HasExited) {
+                  Write-Host "[$renderer] the application exited early with code $($process.ExitCode)"
+                  $failed = $true
+              } else {
+                  Write-Host "[$renderer] the application is still running after 20 seconds"
+              }
+              try {
+                  $bounds = [System.Windows.Forms.SystemInformation]::VirtualScreen
+                  $bitmap = New-Object System.Drawing.Bitmap $bounds.Width, $bounds.Height
+                  $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
+                  $graphics.CopyFromScreen($bounds.Location, [System.Drawing.Point]::Empty, $bounds.Size)
+                  $bitmap.Save((Join-Path (Get-Location) "screenshots\$renderer.png"))
+              } catch { Write-Host "[$renderer] no screenshot: $($_.Exception.Message)" }
+              # A venv's pythonw.exe starts the real interpreter as a child, so stop the whole process tree;
+              # otherwise the first window would still be on screen during the second launch.
+              # taskkill fails when part of the tree is already gone (the real interpreter is a child of this
+              # launcher and may have ended with it), and the step would take its exit code as its own: so it is
+              # run by cmd and forgotten.
+              if (-not $process.HasExited) {
+                  cmd /c "taskkill /PID $($process.Id) /T /F >nul 2>&1"; $global:LASTEXITCODE = 0
+              }
+              Start-Sleep -Seconds 3
+          }
+          $log = Join-Path $env:LOCALAPPDATA 'karamvt\karamvt.log'
+          if (Test-Path $log) {
+              Copy-Item $log screenshots\karamvt.log
+              Write-Host '--- karamvt.log'
+              Get-Content $log
+          }
+          if ($failed) { exit 1 }
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: launch-screenshots
+          path: screenshots/*
+          if-no-files-found: ignore

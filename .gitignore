@@ -1,0 +1,69 @@
+# ── Python bytecode & caches ────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# ── Virtual environments ────────────────────────────────────────────────────
+# scripts/install-*.sh create .venv in the project root
+.venv/
+venv/
+env/
+
+# ── Python packaging output ─────────────────────────────────────────────────
+# (anchored to the project root, so they never match the real src/ package)
+*.egg-info/
+/build/
+/dist/
+*.egg
+.eggs/
+pip-wheel-metadata/
+
+# ── Distro packages: output of packaging/build.sh and packaging/build-arch.sh ─
+/packaging/work/
+/packaging/dist/
+*.deb
+*.rpm
+*.pkg.tar.*
+
+# Leftovers if makepkg is run by hand inside packaging/arch/
+# (NOT a bare "src/" or "pkg/": that would hide the real source folder)
+/packaging/arch/src/
+/packaging/arch/pkg/
+/packaging/arch/*.tar.gz
+
+# ── Local models & partial downloads ────────────────────────────────────────
+# The app keeps models and saved progress in ~/.local/share/karamvt (outside the
+# repo). These only matter if you point the models folder inside the project.
+/models/
+*.gguf
+*.traineddata
+*.part
+
+# ── Secrets ─────────────────────────────────────────────────────────────────
+.env
+.env.*
+
+# ── Editors & OS junk ───────────────────────────────────────────────────────
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+*.log
+
+# ── Portable Tesseract that packaging/build-windows.ps1 prepares for the Windows installer ──
+/packaging/tesseract/
+
+# ── GTK 4 runtime that packaging/build-windows.ps1 prepares for the Windows installer ──
+/packaging/gtk/
+/packaging/python/
+/packaging/wheelhouse/
+/packaging/vcruntime/
